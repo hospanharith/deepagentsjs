@@ -12,10 +12,16 @@ import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { createTaskTool } from "./subAgent.js";
 import { getDefaultModel } from "./model.js";
 import { writeTodos, readFile, writeFile, editFile, ls } from "./tools.js";
-import type { CreateDeepAgentParams } from "./types.js";
+import { InteropZodObject } from "@langchain/core/utils/types";
+import type {
+  PostModelHook,
+  AnyAnnotationRoot,
+  CreateDeepAgentParams,
+} from "./types.js";
 import type { StructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import { DeepAgentState } from "./state.js";
+import { createInterruptHook } from "./interrupt.js";
 
 /**
  * Base prompt that provides instructions about available tools
@@ -49,24 +55,38 @@ const BUILTIN_TOOLS: StructuredTool[] = [
  * Combines built-in tools with provided tools, creates task tool using createTaskTool(),
  * and returns createReactAgent with proper configuration.
  * Ensures exact parameter matching and behavior with Python version.
+ *
  */
 export function createDeepAgent<
   StateSchema extends z.ZodObject<any, any, any, any, any>,
->(params: CreateDeepAgentParams<StateSchema> = {}) {
+  ContextSchema extends
+    | AnyAnnotationRoot
+    | InteropZodObject = AnyAnnotationRoot,
+>(params: CreateDeepAgentParams<StateSchema, ContextSchema> = {}) {
   const {
     tools = [],
     instructions,
     model = getDefaultModel(),
     subagents = [],
     postModelHook,
+    contextSchema,
+    interruptConfig = {},
+    builtinTools,
   } = params;
 
   const stateSchema = params.stateSchema
     ? DeepAgentState.extend(params.stateSchema.shape)
     : DeepAgentState;
 
+  // Filter built-in tools if builtinTools parameter is provided
+  const selectedBuiltinTools = builtinTools
+    ? BUILTIN_TOOLS.filter((tool) =>
+        builtinTools.some((bt) => bt === tool.name),
+      )
+    : BUILTIN_TOOLS;
+
   // Combine built-in tools with provided tools
-  const allTools: StructuredTool[] = [...BUILTIN_TOOLS, ...tools];
+  const allTools: StructuredTool[] = [...selectedBuiltinTools, ...tools];
   // Create task tool using createTaskTool() if subagents are provided
   if (subagents.length > 0) {
     // Create tools map for task tool creation
@@ -91,12 +111,34 @@ export function createDeepAgent<
     ? instructions + BASE_PROMPT
     : BASE_PROMPT;
 
+  // Should never be the case that both are specified
+  if (postModelHook && Object.keys(interruptConfig).length > 0) {
+    throw new Error(
+      "Cannot specify both postModelHook and interruptConfig together. " +
+        "Use either interruptConfig for tool interrupts or postModelHook for custom post-processing.",
+    );
+  }
+
+  let selectedPostModelHook: PostModelHook | undefined;
+  if (postModelHook !== undefined) {
+    selectedPostModelHook = postModelHook;
+  } else if (Object.keys(interruptConfig).length > 0) {
+    selectedPostModelHook = createInterruptHook(interruptConfig);
+  } else {
+    selectedPostModelHook = undefined;
+  }
+
   // Return createReactAgent with proper configuration
-  return createReactAgent({
+  return createReactAgent<
+    typeof stateSchema,
+    Record<string, any>,
+    ContextSchema
+  >({
     llm: model,
     tools: allTools,
     stateSchema,
     messageModifier: finalInstructions,
-    postModelHook,
+    contextSchema,
+    postModelHook: selectedPostModelHook,
   });
 }
